@@ -59,6 +59,9 @@ struct AddonManifest: Decodable, Sendable, Hashable {
 struct Addon: Identifiable, Sendable, Hashable {
     let manifestURL: URL
     let manifest: AddonManifest
+    /// Enable/disable state; lives in the value so SwiftUI's `Toggle(..., selection)`-style
+    /// bindings work without a parallel observable object per add-on. Persisted via `AddonPrefs`.
+    var enabled: Bool = true
     var id: String { manifestURL.absoluteString }
     var baseURL: URL { manifestURL.deletingLastPathComponent() }
     var homeCatalogs: [AddonManifest.CatalogDef] { (manifest.catalogs ?? []).filter(\.isBrowsable) }
@@ -103,6 +106,12 @@ struct MetaPreview: Identifiable, Sendable, Hashable {
     var year: Int? {
         guard let r = releaseInfo?.trimmingCharacters(in: .whitespaces), r.count >= 4 else { return nil }
         return Int(r.prefix(4))
+    }
+    /// Same extraction as a static, for values that aren't on a `MetaPreview` yet
+    /// (AIOMetadata's raw meta objects reuse this during mapping).
+    static func yearOf(_ releaseInfo: String?) -> Int? {
+        MetaPreview(id: "", type: "", name: "", poster: nil, background: nil, logo: nil,
+                    description: nil, releaseInfo: releaseInfo).year
     }
     /// Which service the `rating` number comes from.
     var ratingLabel: String { id.hasPrefix("tmdb:") ? "TMDB" : "IMDb" }

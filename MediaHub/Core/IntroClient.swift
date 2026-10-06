@@ -36,7 +36,7 @@ actor IntroClient {
 
         // TMDB id first (most accurate), then IMDb: a title missing under one id is often present under the other.
         var ids: [URLQueryItem] = []
-        if let tmdb = await TMDBClient.shared.tmdbIdentifier(for: item.id, type: item.type) {
+        if let tmdb = await MetadataService.shared.tmdbIdentifier(for: item) {
             ids.append(URLQueryItem(name: "tmdb_id", value: String(tmdb)))
         }
         if imdb.hasPrefix("tt") { ids.append(URLQueryItem(name: "imdb_id", value: imdb)) }

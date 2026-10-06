@@ -12,12 +12,12 @@ enum TitleActions {
             var s = season, e = episode
             var minutes: Int?
             if item.type == "series", s == nil || e == nil,
-               let d = await TMDBClient.shared.cachedDetails(for: item.id, type: item.type) {
+               let d = await MetadataService.shared.cachedDetails(for: item) {
                 s = s ?? d.seasons?.map(\.seasonNumber).max().flatMap { $0 == 0 ? nil : $0 } ?? d.numberOfSeasons
                 e = e ?? d.numberOfEpisodes
                 minutes = d.minutes
             } else if item.type != "series",
-                      let d = await TMDBClient.shared.cachedDetails(for: item.id, type: item.type) {
+                      let d = await MetadataService.shared.cachedDetails(for: item) {
                 minutes = d.minutes
             }
             if item.type == "series" {

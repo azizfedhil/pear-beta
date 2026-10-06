@@ -10,7 +10,7 @@ enum SettingsBackup {
     static let version = 1
 
     static let keys = [
-        "addon.manifestURLs", "tmdb.key", "tvdb.key", "tvdb.pin", "mdblist.key", "mdblist.lists", "simkl.clientID",
+        "addon.manifestURLs", "addon.prefs", "metadata.source", "aio.baseURL", "aio.apiKeyDefault", "tmdb.key", "tvdb.key", "tvdb.pin", "mdblist.key", "mdblist.lists", "simkl.clientID",
         "ui.accent", "ui.networkBadges", "ui.titleLogos", "player.glass", "player.autoplayNext",
         "skip.enabled", "skip.fallbackSeconds", "sub.lang", "sub.style", "subs.online", "subs.baseURL", "library.collapsed",
         "profiles.list", "profiles.active", "pinned.sources",
@@ -51,6 +51,8 @@ enum SettingsBackup {
 
     private static func isAllowed(_ k: String, includeData: Bool) -> Bool {
         if keys.contains(k) { return true }
+        // AIOMetadata adopts the API-key name its manifest declares ("aio.<name>"); back it up too.
+        if k.hasPrefix("aio.") { return true }
         return includeData && dataPrefixes.contains { k == $0 || k.hasPrefix($0 + ".") }
     }
 }

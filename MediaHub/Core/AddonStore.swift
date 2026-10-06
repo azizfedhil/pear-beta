@@ -3,10 +3,14 @@ import Observation
 
 @MainActor @Observable
 final class AddonStore {
+    /// Every installed add-on, in display order: enabled ones first (by rank), disabled ones trail.
     private(set) var addons: [Addon] = []
     /// Bumps after a reload so Home refetches catalogs even though the add-on ids are unchanged.
     private(set) var revision = 0
+    /// The enabled add-ons in priority order — what every request path (catalogs, search, streams) should use.
+    var activeAddons: [Addon] { addons.filter(\.enabled) }
     private let key = "addon.manifestURLs"
+    static let prefsKey = "addon.prefs"
     // Public metadata-only add-on, so Home isn't empty on first launch.
     private static let defaults = ["https://v3-cinemeta.strem.io/manifest.json"]
 
@@ -57,10 +61,74 @@ final class AddonStore {
         persist()
     }
 
-    // TODO: move to Keychain — debrid add-on URLs embed API keys.
-    private func persist() {
-        UserDefaults.standard.set(addons.map(\.manifestURL.absoluteString), forKey: key)
+    /// Enables or disables an add-on without deleting it. Disabled add-ons drop out of
+    /// `activeAddons` (so no catalog / search / stream request goes to them) and move to the end
+    /// of the list; re-enabling puts the add-on back at the top of the enabled block.
+    func setEnabled(_ id: String, _ on: Bool) {
+        guard let i = addons.firstIndex(where: { $0.id == id }), addons[i].enabled != on else { return }
+        addons[i].enabled = on
+        persist()   // writes the flag into prefs, then `sortAddons` re-applies the persisted order
     }
+
+    /// Reorders the visible list (Settings' reorder mode); the new order is written as ranks by `persist`.
+    func move(from source: IndexSet, to destination: Int) {
+        addons.move(fromOffsets: source, toOffset: destination)
+        persist(sorted: true)
+    }
+
+    // TODO: move to Keychain — debrid add-on URLs embed API keys.
+    private func persist(sorted doSort: Bool = false) {
+        var prefs = Self.loadPrefs()
+        for a in addons { prefs.states[a.id]?.enabled = a.enabled }
+        if doSort {
+            // A manual move: adopt the UI order, then restore the enabled-first invariant so a
+            // disabled add-on dragged into the enabled block can't bake in a rank that flips back
+            // on next launch (`sortAddons` always re-splits enabled/disabled). Relative order of
+            // the enabled block — the actual priority pipeline — is exactly what the user arranged.
+            let moved = addons.sorted { x, y in orderHint[x.id, default: .max] < orderHint[y.id, default: .max] }
+            addons = moved.filter(\.enabled) + moved.filter { !$0.enabled }
+            orderHint = Dictionary(uniqueKeysWithValues: addons.enumerated().map { ($1.id, $0) })
+        } else {
+            sortAddons(using: prefs)
+        }
+        prefs.apply(order: addons.map(\.id))   // rewrites ranks and drops entries of removed add-ons
+        UserDefaults.standard.set(addons.map(\.manifestURL.absoluteString), forKey: key)
+        savePrefs(prefs)
+        publishPriority()
+    }
+
+    /// Hands the enabled-in-priority-order list to the metadata facade. One plain array copy per
+    /// user-initiated change — no observers, timers or polling involved.
+    private func publishPriority() {
+        MetadataService.shared.setActiveAddons(activeAddons)
+    }
+
+    /// Transient UI order while a manual move hasn't been written to disk yet (reorder mode only).
+    private var orderHint: [String: Int] = [:]
+
+    /// Round-trips through `AddonPrefs`' own Codable conformance, so its tolerant per-entry
+    /// decoding actually applies: one malformed entry is skipped instead of dropping every
+    /// user's enable/order state. The encoded shape is identical to the old `[id: State]`
+    /// dictionary, so existing stored files migrate unchanged.
+    static func loadPrefs() -> AddonPrefs {
+        guard let d = UserDefaults.standard.data(forKey: prefsKey),
+              let p = try? JSONDecoder().decode(AddonPrefs.self, from: d) else { return AddonPrefs() }
+        return p
+    }
+
+    private static func savePrefs(_ prefs: AddonPrefs) {
+        if let d = try? JSONEncoder().encode(prefs) {
+            UserDefaults.standard.set(d, forKey: prefsKey)
+        }
+    }
+
+    /// Applies the persisted enable/order state to the in-memory list (enabled first, then rank).
+    private func sortAddons(using prefs: AddonPrefs) {
+        for i in addons.indices { addons[i].enabled = prefs.isEnabled(addons[i].id) }
+        addons.sort { prefs.order($0, $1) }
+    }
+
+    private func sortAddons() { sortAddons(using: Self.loadPrefs()) }
 
     private func restore(_ urls: [String]) async {
         var found: [Int: Addon] = [:]
@@ -75,5 +143,11 @@ final class AddonStore {
             for await (i, a) in group { found[i] = a }
         }
         addons = found.keys.sorted().compactMap { found[$0] }
+        sortAddons()
+        // Prune prefs for add-ons that no longer resolve, then rewrite the surviving ranks.
+        var prefs = Self.loadPrefs()
+        prefs.normalize(ids: Set(addons.map(\.id)))
+        Self.savePrefs(prefs)
+        publishPriority()
     }
 }

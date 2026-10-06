@@ -40,7 +40,7 @@ final class ExploreModel {
 
     func loadGenres() async {
         let k = kind
-        let list = await TMDBClient.shared.genres(k)
+        let list = await MetadataService.shared.genres(kind: k)
         if k == kind { genres = list }
     }
 
@@ -51,14 +51,15 @@ final class ExploreModel {
     }
 
     func loadMore() async {
-        guard hasMore, !isLoading, TMDBClient.shared.hasKey else { return }
+        // The facade's gate: a TMDB key, or AIOMetadata mode with an endpoint configured.
+        guard hasMore, !isLoading, MetadataService.shared.browseAvailable else { return }
         let gen = generation
         isLoading = true
         defer { if gen == generation { isLoading = false } }
         let next = page + 1
         let fresh: [MetaPreview]
-        if isTrending { fresh = (try? await TMDBClient.shared.trending(kind, page: next)) ?? [] }
-        else { fresh = (try? await TMDBClient.shared.discover(kind: kind, genre: genre, year: year, sort: sort, page: next)) ?? [] }
+        if isTrending { fresh = await MetadataService.shared.trending(kind: kind, page: next) }
+        else { fresh = await MetadataService.shared.discover(kind: kind, genre: genre, year: year, sort: sort, page: next) }
         guard gen == generation else { return }          // filters changed while this page was loading
         page = next
         let known = Set(items.map(\.id))
@@ -79,9 +80,11 @@ struct ExploreView: View {
     var body: some View {
         NavigationStack {
             Group {
-                if tmdbKey.isEmpty {
+                // Browsing needs either a TMDB key or AIOMetadata mode with an endpoint configured;
+                // the facade decides which backend answers each call.
+                if !MetadataService.shared.browseAvailable {
                     ContentUnavailableView("Explore needs TMDB", systemImage: "safari",
-                        description: Text("Add a free TMDB API key in Settings → Integrations to browse trending titles and filter by genre and year."))
+                        description: Text("Add a free TMDB API key in Settings → Integrations to browse trending titles and filter by genre and year — or pick AIOMetadata as the metadata source and set its endpoint there."))
                 } else { content }
             }
             .navigationTitle("Explore")
@@ -89,11 +92,19 @@ struct ExploreView: View {
             .navigationDestination(for: MetaPreview.self) { DetailView(item: $0) }
         }
         .task(id: tmdbKey) {
-            guard !tmdbKey.isEmpty else { return }
+            // Re-runs when the key changes; AIOMetadata-mode switches re-enter via `mode` below.
+            guard MetadataService.shared.browseAvailable else { return }
             async let g: () = model.loadGenres()
             async let t: () = model.loadThemes()
             if model.items.isEmpty { await model.reload() }
             _ = await (g, t)
+        }
+        .task(id: MetadataService.shared.mode) {
+            // A user who enables AIOMetadata later gets Explore content without relaunching —
+            // one-shot on change, no polling involved.
+            guard MetadataService.shared.mode == .aiometadata,
+                  MetadataService.shared.browseAvailable else { return }
+            if model.items.isEmpty { await model.reload() }
         }
     }
 

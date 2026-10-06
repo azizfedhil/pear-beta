@@ -27,7 +27,7 @@ actor TitleFactsStore {
     /// Cached facts, else one TMDB request (not cached when it fails, so offline never poisons the store).
     func facts(for item: MetaPreview) async -> TitleFacts? {
         if let hit = cache[item.id] { return hit }
-        guard let d = await TMDBClient.shared.basicDetails(for: item.id, type: item.type) else { return nil }
+        guard let d = await MetadataService.shared.basicDetails(for: item) else { return nil }
         var f = TitleFacts()
         f.genres = (d.genres ?? []).map(\.name)
         if let m = d.minutes, m > 0 { f.runtime = m }

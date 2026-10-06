@@ -58,12 +58,10 @@ enum EpisodeLoader {
 }
 
 enum SourceResolver {
-    /// Stremio id for a title: TMDB-sourced items are mapped to their IMDb id.
+    /// Stremio id for a title. Delegates to the unified metadata layer so id resolution and its
+    /// caching have exactly one owner; kept as an entry point because stream code calls it widely.
     static func stremioID(for item: MetaPreview) async -> String? {
-        if item.id.hasPrefix("tmdb:"), let n = Int(item.id.dropFirst(5)) {
-            return await TMDBClient.shared.imdbID(tmdb: n, type: item.type)
-        }
-        return item.id
+        await MetadataService.shared.stremioID(for: item)
     }
 
     /// Picks the stream for another episode, preferring (1) the add-on and release name that is playing now,

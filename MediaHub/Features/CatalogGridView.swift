@@ -29,10 +29,10 @@ final class GridModel {
         case .none:
             break
         case .tmdbTrending(let kind):
-            fresh = (try? await TMDBClient.shared.trending(kind, page: tmdbPage + 1)) ?? []
+            fresh = await MetadataService.shared.trending(kind: kind, page: tmdbPage + 1)
             if !fresh.isEmpty { tmdbPage += 1 }
         case .addon(let addon, let cat):
-            fresh = (try? await AddonClient.shared.catalog(addon: addon, catalog: cat, skip: fetched)) ?? []
+            fresh = await MetadataService.shared.catalog(addon: addon, catalog: cat, skip: fetched)
             fetched += fresh.count
         }
         let known = Set(items.map(\.id))
