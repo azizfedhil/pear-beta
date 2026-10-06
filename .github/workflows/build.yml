@@ -1,0 +1,25 @@
+name: Build IPA
+# Manual only: run it from the Actions tab -> "Build IPA" -> "Run workflow".
+on:
+  workflow_dispatch:
+jobs:
+  build:
+    runs-on: macos-26
+    steps:
+      - uses: actions/checkout@v4
+      - run: xcodebuild -version
+      - run: brew install xcodegen && xcodegen
+      - name: Build (unsigned)
+        run: |
+          xcodebuild -project MediaHub.xcodeproj -scheme MediaHub -configuration Release \
+            -sdk iphoneos -destination 'generic/platform=iOS' -derivedDataPath build \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" build
+      - name: Package IPA
+        run: |
+          mkdir Payload
+          cp -R build/Build/Products/Release-iphoneos/MediaHub.app Payload/
+          zip -qr MediaHub.ipa Payload
+      - uses: actions/upload-artifact@v4
+        with:
+          name: MediaHub-ipa
+          path: MediaHub.ipa
