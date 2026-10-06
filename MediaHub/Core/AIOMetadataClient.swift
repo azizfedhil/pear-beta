@@ -41,7 +41,7 @@ actor AIOMetadataClient {
     private var seasonListCache: [String: [TMDBClient.SeasonInfo]?] = [:]  // imdb -> seasons (nil = asked, no answer)
     private var logoCache: [String: URL?] = [:]
     private var idCache: [String: String?] = [:]           // tmdb:… -> stremio/IMDb id
-    private var inflight: [String: Task<Any?, Never>] = [:]   // type-erased; `coalesce` casts results back to T
+    private var inflight: [String: Task<Any, Error>] = [:]   // type-erased; `coalesce` casts results back to T
 
     /// Safe default: nothing is configured until the user enters a URL, so `.aiometadata` mode
     /// behaves exactly like `.builtin` (zero extra requests) until then.
@@ -138,8 +138,8 @@ actor AIOMetadataClient {
         let resources: [Resource]?
         let catalogs: [Catalog]?
         /// Older manifests declare resources as plain strings ("stream"); accept both shapes.
-        init(from d: Decoder) throws {
-            let c = try Container(keyedBy: K.self)
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: K.self)
             id = try c.decodeIfPresent(String.self, forKey: .id)
             name = try c.decodeIfPresent(String.self, forKey: .name)
             version = try c.decodeIfPresent(String.self, forKey: .version)
@@ -238,7 +238,7 @@ actor AIOMetadataClient {
         var req = URLRequest(url: url)
         if !apiKeyValue.isEmpty {
             req.setValue(apiKeyValue, forHTTPHeaderField: "X-API-KEY")     // common gateway convention
-            req.URL = appendingQuery(to: url, items: [(apiKeyName, apiKeyValue)])
+            req.url = appendingQuery(to: url, items: [(apiKeyName, apiKeyValue)])
         }
         let (d, resp) = try await session.data(for: req)
         guard (resp as? HTTPURLResponse)?.statusCode == 200 else { throw URLError(.badServerResponse) }
@@ -272,8 +272,8 @@ actor AIOMetadataClient {
         }
         let t = Task { await work() }
         inflight[key] = t
-        defer { if inflight[key] === t { inflight[key] = nil } }
-        return await t.value
+        defer { inflight.removeValue(forKey: key) }
+        return await t.value as! T
     }
 
     private func encoded(_ s: String) -> String {
@@ -305,7 +305,7 @@ actor AIOMetadataClient {
     }
 
     private func provides(_ resource: String, type: String, id: String) async -> Bool {
-        guard let rs = manifest()?.resources else { return false }
+        guard let rs = await manifest()?.resources else { return false }
         for r in rs where r.name == resource {
             if let t = r.types, !t.contains(type) { continue }
             if let p = r.idPrefixes, !p.contains(where: id.hasPrefix) { continue }
@@ -330,8 +330,9 @@ actor AIOMetadataClient {
         return await coalesce("meta:" + key) { () -> AIMeta? in
             if let hit = self.metaCache[key] { return hit }
             guard let url = URL(string: self.baseURL + "/meta/\(type)/\(self.encoded(id)).json"),
-                  let d = try? await self.data(url),
-                  let m = try? JSONDecoder().decode(AIMetaResponse.self, from: d)?.meta else { return nil }
+                  let d = try? await self.data(url) else { return nil }
+            guard let res = try? JSONDecoder().decode(AIMetaResponse.self, from: d),
+                  let m = res.meta else { return nil }
             self.metaCache[key] = m
             return m
         }
@@ -350,7 +351,7 @@ actor AIOMetadataClient {
         if let di = m.director, !di.isEmpty { crew = (crew ?? []) + di.map { .init(name: $0, job: "Director") } }
         let d = TMDBClient.Details(
             overview: m.description, tagline: nil,
-            runtime: Self.digits(m.runtime), episodeRunTime: nil,
+            runtime: AIMeta.digits(m.runtime), episodeRunTime: nil,
             voteAverage: m.imdbRating.flatMap(Double.init),
             genres: m.genres?.map { .init(name: $0) },
             numberOfSeasons: nil, numberOfEpisodes: nil,
@@ -440,8 +441,9 @@ actor AIOMetadataClient {
             var path = self.baseURL + "/catalog/\(type)/\(cat.id)"
             if !parts.isEmpty { path += "/" + parts.joined(separator: "&") }
             guard let url = URL(string: path + ".json"),
-                  let d = try? await self.data(url),
-                  let metas = try? JSONDecoder().decode(AICatalogResponse.self, from: d)?.metas else { return [] }
+                  let d = try? await self.data(url) else { return [] }
+            guard let res = try? JSONDecoder().decode(AICatalogResponse.self, from: d),
+                  let metas = res.metas else { return [] }
             let out = metas.map { $0.preview }
             self.listCache[key] = out
             return out
@@ -516,7 +518,7 @@ actor AIOMetadataClient {
         let base = !raw.isEmpty ? normalizedBase(raw)
             : (!AIOMetadataClient.shared.baseURL.isEmpty ? AIOMetadataClient.shared.baseURL
                : (fallbackSeasonBase ?? ""))
-        guard !base.isEmpty else { return nil }
+        guard let base, !base.isEmpty else { return nil }
         let path = base.hasSuffix("/proxy") ? "" : "/proxy"
         let safe = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "-._~"))
         guard let e = imdb.addingPercentEncoding(withAllowedCharacters: safe) else { return nil }
@@ -537,8 +539,12 @@ actor AIOMetadataClient {
             var result: [TMDBClient.SeasonInfo]?
             if let url = Self.seasonDetailsURL(imdb: imdb),
                let (d, resp) = try? await Self.seasonSession.data(from: url),
-               (resp as? HTTPURLResponse)?.statusCode == 200,
-               let list = try? JSONDecoder().decode(SEResponse.self, from: d)?.seasons {
+               (resp as? HTTPURLResponse)?.statusCode == 200 {
+                guard let res = try? JSONDecoder().decode(SEResponse.self, from: d),
+                      let list = res.seasons else {
+                    self.seasonListCache[key] = result      // cached miss included: ask once per run
+                    return result
+                }
                 let parsed = list.compactMap { s -> TMDBClient.SeasonInfo? in
                     guard let n = s.season else { return nil }
                     return TMDBClient.SeasonInfo(id: n, name: s.title, seasonNumber: n,

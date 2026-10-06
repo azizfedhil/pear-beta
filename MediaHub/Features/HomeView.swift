@@ -96,7 +96,9 @@ final class HomeModel {
         // automatically. Deterministic path, checked once per load; the manifest probe behind it is
         // cached per run, so this adds no polling and no repeat requests.
         if !addons.contains(where: { !$0.homeCatalogs.isEmpty }) {
-            let out = await meta.homeRows(type: "movie", limit: 3) + await meta.homeRows(type: "series", limit: 3)
+            let movies = await meta.homeRows(type: "movie", limit: 3)
+            let series = await meta.homeRows(type: "series", limit: 3)
+            let out = movies + series
             if !out.isEmpty { rows = out; return }
         }
         let jobs = addons.flatMap { a in a.homeCatalogs.map { (a, $0) } }.prefix(12)
