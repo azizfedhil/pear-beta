@@ -260,7 +260,7 @@ final class MetadataService {
     func episodes(for item: MetaPreview, season: Int) async -> [EpisodeItem] {
         if aioActive {
             let aio = await AIOMetadataClient.shared.episodes(id: item.id, type: item.type, season: season)
-            if let aio, !aio.isEmpty { return fillEpisodes(aio, item: item, season: season) }
+            if let aio, !aio.isEmpty { return await fillEpisodes(aio, item: item, season: season) }
             // nil / empty answer: fall through to the built-in chain below.
         }
         return await EpisodeLoader.load(itemID: item.id, type: item.type, season: season) {

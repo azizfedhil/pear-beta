@@ -93,7 +93,7 @@ final class AddonStore {
         }
         prefs.apply(order: addons.map(\.id))   // rewrites ranks and drops entries of removed add-ons
         UserDefaults.standard.set(addons.map(\.manifestURL.absoluteString), forKey: key)
-        savePrefs(prefs)
+        Self.savePrefs(prefs)
         publishPriority()
     }
 
