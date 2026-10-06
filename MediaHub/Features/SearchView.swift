@@ -11,12 +11,14 @@ final class SearchModel {
 
     func reset() { results = []; isSearching = false; hasSearched = false }
 
-    /// Add-ons that declare `search` come first (they carry IMDb ids), then TMDB fills the gaps.
+    /// Add-ons that declare `search` come first (they carry IMDb ids); the metadata facade decides
+    /// which provider (built-in TMDB or AIOMetadata) fills the rest and merges duplicates by name+year.
     func run(_ raw: String, addons: [Addon]) async {
         let q = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard q.count >= 2 else { reset(); return }
         isSearching = true
 
+        let meta = MetadataService.shared
         var jobs: [(Addon, AddonManifest.CatalogDef)] = []
         for a in addons { for c in a.manifest.catalogs ?? [] where c.isSearchable { jobs.append((a, c)) } }
         jobs = Array(jobs.prefix(6))
@@ -24,13 +26,14 @@ final class SearchModel {
         await withTaskGroup(of: (Int, [MetaPreview]).self) { group in
             for (i, job) in jobs.enumerated() {
                 group.addTask {
-                    let items = (try? await AddonClient.shared.catalog(addon: job.0, catalog: job.1, search: q)) ?? []
+                    let items = await meta.catalog(addon: job.0, catalog: job.1, search: q)
                     return (i, items)
                 }
             }
             for await (i, items) in group { byIndex[i] = items }
         }
-        let tmdb = await TMDBClient.shared.search(q)
+        guard !Task.isCancelled else { return }   // a newer keystroke owns the UI now
+        let providerResults = await meta.search(query: q)
         guard !Task.isCancelled else { return }
 
         var out: [MetaPreview] = []
@@ -49,7 +52,7 @@ final class SearchModel {
             out.append(m)
         }
         for i in jobs.indices { (byIndex[i] ?? []).forEach(add) }
-        tmdb.forEach(add)
+        providerResults.forEach(add)
         results = out
         hasSearched = true
         isSearching = false
@@ -104,7 +107,7 @@ struct SearchView: View {
             // Debounce: only the last keystroke in a 350 ms window hits the network.
             try? await Task.sleep(for: .milliseconds(350))
             guard !Task.isCancelled else { return }
-            await model.run(query, addons: store.addons)
+            await model.run(query, addons: store.activeAddons)
         }
     }
 

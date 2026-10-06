@@ -26,6 +26,7 @@ struct SettingsView: View {
     @State private var busy = false
     @State private var reloading = Set<String>()
     @State private var reloadNote: String?
+    @State private var reorderMode = false
     @State private var includeData = false
     @State private var exportDoc: BackupDocument?
     @State private var showExporter = false
@@ -40,6 +41,15 @@ struct SettingsView: View {
         NavigationStack {
             Form {
                 Section {
+                    Picker("Metadata source", selection: Binding(
+                        get: { MetadataService.shared.mode },
+                        set: { MetadataService.shared.mode = $0 })) {
+                        ForEach(MetadataSourceMode.allCases) { Text($0.label).tag($0) }
+                    }
+                    if MetadataService.shared.mode == .aiometadata {
+                        Text("AIOMetadata isn't wired up yet, so titles keep coming from the built-in integrations until it is.")
+                            .font(.footnote).foregroundStyle(.secondary)
+                    }
                     NavigationLink { IntegrationsView() } label: {
                         HStack {
                             Label("Integrations", systemImage: "puzzlepiece.extension.fill")
@@ -48,7 +58,7 @@ struct SettingsView: View {
                         }
                     }
                 } footer: {
-                    Text("TMDB, TheTVDB, MDBList and Simkl: API keys, logins and metadata sources.")
+                    Text("Choose which backend answers title metadata: the built-in integrations (TMDB, TheTVDB, MDBList and add-ons like Cinemeta) or AIOMetadata. Stream add-ons are unaffected either way — sources always come from your installed add-ons. API keys below stay saved regardless of the chosen source.")
                 }
 
                 Section {
@@ -116,15 +126,19 @@ struct SettingsView: View {
                     Text("The file contains your API keys and add-on URLs, so keep it private. The Simkl login isn't included; reconnect it after importing.")
                 }
 
-                Section("Add-ons") {
+                Section {
                     ForEach(store.addons) { a in
                         HStack {
                             VStack(alignment: .leading) {
                                 Text(a.manifest.name).font(.headline)
+                                    .foregroundStyle(a.enabled ? Color.primary : Color.secondary)
                                 if let d = a.manifest.description { Text(d).font(.caption).foregroundStyle(.secondary).lineLimit(2) }
                             }
                             Spacer()
                             if reloading.contains(a.id) { ProgressView() }
+                            Toggle("", isOn: Binding(get: { a.enabled }, set: { store.setEnabled(a.id, $0) }))
+                                .labelsHidden()
+                                .tint(theme.accent)
                         }
                         .swipeActions(edge: .leading) {
                             Button { reload(a) } label: { Label("Reload", systemImage: "arrow.clockwise") }.tint(.blue)
@@ -134,7 +148,12 @@ struct SettingsView: View {
                         }
                     }
                     .onDelete { store.remove(at: $0) }
+                    .onMove { store.move(from: $0, to: $1) }
                     if !store.addons.isEmpty {
+                        Button { reorderMode.toggle() } label: {
+                            Label(reorderMode ? "Done Reordering" : "Reorder Add-ons",
+                                  systemImage: reorderMode ? "checkmark" : "arrow.up.arrow.down")
+                        }
                         Button {
                             Task {
                                 reloading = Set(store.addons.map(\.id))
@@ -146,6 +165,15 @@ struct SettingsView: View {
                             .disabled(!reloading.isEmpty)
                     }
                     if let reloadNote { Text(reloadNote).font(.footnote).foregroundStyle(.secondary) }
+                } header: {
+                    HStack {
+                        Text("Add-ons")
+                        Spacer()
+                        Text("\(store.activeAddons.count) of \(store.addons.count) active")
+                            .font(.footnote.weight(.regular)).foregroundStyle(.secondary)
+                    }
+                } footer: {
+                    Text("Order sets priority: catalogs, search and stream sources ask the top add-on first. Disabled add-ons stay installed but are skipped everywhere. Swipe right on an add-on to reload its manifest; swipe left to delete it.")
                 }
                 Section {
                     TextField("Add-on URL", text: $urlText)
@@ -171,6 +199,8 @@ struct SettingsView: View {
             }
             .navigationTitle("Settings")
             .profileToolbar()
+            .environment(\.editMode, Binding(get: { reorderMode ? .active : .inactive },
+                                             set: { reorderMode = $0 == .active }))
             .scrollDismissesKeyboard(.interactively)
             .toolbar {
                 ToolbarItemGroup(placement: .keyboard) {
@@ -205,7 +235,7 @@ struct SettingsView: View {
         defer { if scoped { url.stopAccessingSecurityScopedResource() } }
         do {
             let n = try SettingsBackup.restore(try Data(contentsOf: url))
-            theme.reload(); profiles.reload(); history.reload(); library.reload(); watchLog.reload(); pins.reload(); libraryPrefs.reload()
+            theme.reload(); profiles.reload(); history.reload(); library.reload(); watchLog.reload(); pins.reload(); libraryPrefs.reload(); MetadataService.shared.reload()
             Task { await store.reloadFromDefaults() }
             backupNote = "Imported \(n) settings."
         } catch {

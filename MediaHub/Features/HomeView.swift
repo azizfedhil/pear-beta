@@ -36,12 +36,13 @@ final class HomeModel {
 
     func loadLists(selected: Set<Int>) async {
         guard MDBListClient.shared.hasKey, !selected.isEmpty else { lists = []; return }
-        let chosen = await MDBListClient.shared.userLists().filter { selected.contains($0.id) }
+        let meta = MetadataService.shared
+        let chosen = (await meta.mdbUserLists()).filter { selected.contains($0.id) }
         var done: [Int: CatalogRow] = [:]
         await withTaskGroup(of: (Int, CatalogRow?).self) { group in
             for (i, l) in chosen.enumerated() {
                 group.addTask {
-                    let items = await MDBListClient.shared.items(listID: l.id)
+                    let items = await meta.mdbListItems(listID: l.id)
                     return (i, items.isEmpty ? nil : CatalogRow(id: "mdb-\(l.id)", title: l.name, items: items, symbol: "list.star"))
                 }
             }
@@ -66,36 +67,46 @@ final class HomeModel {
         return Array(src.filter { $0.backdropURL != nil || $0.posterURL != nil }.prefix(7))
     }
 
-    private nonisolated static func recommendations(after last: MetaPreview?) async -> [MetaPreview] {
-        guard let l = last else { return [] }
-        return (try? await TMDBClient.shared.recommendations(for: l.id, type: l.type)) ?? []
-    }
-
-    /// TMDB trending + recommendations based on the last thing you watched.
+    /// Trending + recommendations through the unified metadata layer, based on the last thing you watched.
     func loadSuggestions(last: MetaPreview?) async {
-        guard TMDBClient.shared.hasKey else { suggested = []; return }
-        async let movies = try? await TMDBClient.shared.trending("movie")
-        async let shows = try? await TMDBClient.shared.trending("tv")
-        async let because = Self.recommendations(after: last)
-        let (m, t, b) = await (movies, shows, because)
+        // TMDB key OR a configured AIOMetadata endpoint can answer trending — otherwise a user who
+        // relies solely on AIOMetadata would lose the hero and trending rows (Cinemeta replacement).
+        guard TMDBClient.shared.hasKey || MetadataService.shared.aioActive else { suggested = []; return }
+        let meta = MetadataService.shared
+        // Recommendations need an item; start that call only once we have one (no duplicate work).
+        var becauseTask: Task<[MetaPreview], Never>? = nil
+        if let l = last { becauseTask = Task { await meta.recommendations(for: l) } }
+        async let movies = meta.trending(kind: "movie")
+        async let shows = meta.trending(kind: "tv")
+        let b = await (becauseTask?.value ?? [])
+        let (m, t) = await (movies, shows)
         var out: [CatalogRow] = []
         if let l = last, !b.isEmpty {
             out.append(CatalogRow(id: "because", title: "Because you watched \(l.name)", items: b, symbol: "sparkles"))
         }
-        if let m, !m.isEmpty { out.append(CatalogRow(id: "trend-movie", title: "Trending Movies", items: m, source: .tmdbTrending("movie"), symbol: "flame.fill")) }
-        if let t, !t.isEmpty { out.append(CatalogRow(id: "trend-tv", title: "Trending Shows", items: t, source: .tmdbTrending("tv"), symbol: "flame.fill")) }
+        if !m.isEmpty { out.append(CatalogRow(id: "trend-movie", title: "Trending Movies", items: m, source: .tmdbTrending("movie"), symbol: "flame.fill")) }
+        if !t.isEmpty { out.append(CatalogRow(id: "trend-tv", title: "Trending Shows", items: t, source: .tmdbTrending("tv"), symbol: "flame.fill")) }
         suggested = out
     }
 
     func load(addons: [Addon]) async {
+        let meta = MetadataService.shared
+        // Cinemeta takeover (disabled/removed meta add-on): when no enabled add-on declares any
+        // browsable catalog, AIOMetadata — if configured and able to answer — supplies Home rows
+        // automatically. Deterministic path, checked once per load; the manifest probe behind it is
+        // cached per run, so this adds no polling and no repeat requests.
+        if !addons.contains(where: { !$0.homeCatalogs.isEmpty }) {
+            let out = await meta.homeRows(type: "movie", limit: 3) + await meta.homeRows(type: "series", limit: 3)
+            if !out.isEmpty { rows = out; return }
+        }
         let jobs = addons.flatMap { a in a.homeCatalogs.map { (a, $0) } }.prefix(12)
         var done: [Int: CatalogRow] = [:]
         await withTaskGroup(of: (Int, CatalogRow?).self) { group in
             for (i, job) in jobs.enumerated() {
                 group.addTask {
                     let (addon, cat) = job
-                    guard let items = try? await AddonClient.shared.catalog(addon: addon, catalog: cat),
-                          !items.isEmpty else { return (i, nil) }
+                    let items = await MetadataService.shared.catalog(addon: addon, catalog: cat)
+                    if items.isEmpty { return (i, nil) }
                     let kind = cat.type == "movie" ? "Movies" : cat.type == "series" ? "Series" : cat.type.capitalized
                     return (i, CatalogRow(id: "\(addon.id)/\(cat.type)/\(cat.id)",
                                           title: "\(cat.name ?? cat.id) \(kind)", items: items,
@@ -167,7 +178,7 @@ struct HomeView: View {
             .navigationDestination(for: MetaPreview.self) { DetailView(item: $0) }
             .navigationDestination(for: ResumeTarget.self) { DetailView(item: $0.item, startSeason: $0.season, startEpisode: $0.episode) }
             .navigationDestination(for: CatalogRow.self) { CatalogGridView(row: $0) }
-            .task(id: store.addons.map(\.id) + [String(store.revision)]) { await model.load(addons: store.addons) }
+            .task(id: store.activeAddons.map(\.id) + [String(store.revision)]) { await model.load(addons: store.activeAddons) }
             .task(id: tmdbKey) { await model.loadThemes() }
             .task(id: mdbKey + mdbLists) { await model.loadLists(selected: selectedLists) }
             .task(id: tmdbKey + (history.lastWatched?.id ?? "")) { await model.loadSuggestions(last: history.lastWatched) }
@@ -183,7 +194,7 @@ struct HomeView: View {
     }
 
     private func refresh() async {
-        async let a: () = model.load(addons: store.addons)
+        async let a: () = model.load(addons: store.activeAddons)
         async let b: () = model.loadSuggestions(last: history.lastWatched)
         async let c: () = model.loadLists(selected: selectedLists)
         async let d: () = model.loadUpNext(history.finishedEntries)
@@ -414,12 +425,9 @@ struct InlineRatings: View {
         .task(id: item.id) {
             extra = []
             guard MDBListClient.shared.hasKey else { return }
-            var imdb: String? = item.id.hasPrefix("tt") ? item.id : nil
-            if imdb == nil, item.id.hasPrefix("tmdb:"), let n = Int(item.id.dropFirst(5)), TMDBClient.shared.hasKey {
-                imdb = await TMDBClient.shared.imdbID(tmdb: n, type: item.type)
-            }
-            guard let imdb else { return }
-            extra = await MDBListClient.shared.ratings(imdb: imdb, type: item.type)
+            // ID resolution + ratings go through the unified metadata layer (TMDB id cache dedupes lookups).
+            guard let imdb = await MetadataService.shared.stremioID(for: item) else { return }
+            extra = await MetadataService.shared.ratings(for: item, imdb: imdb)
         }
     }
 }
@@ -661,7 +669,7 @@ struct PosterCard: View {
             .task(id: item.id) {
                 network = nil
                 guard showNetwork, item.type == "series", TMDBClient.shared.hasKey else { return }
-                network = await TMDBClient.shared.network(for: item.id, type: item.type)
+                network = await MetadataService.shared.networkBadge(for: item)
             }
             // Long tap: dropdown with mark as watched / add to library / details.
             .posterContextMenu(item)

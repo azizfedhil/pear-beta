@@ -986,10 +986,10 @@ struct PlayerScreen: View {
         loadingSources = true; defer { loadingSources = false }
         let r = current
         let sid = (r.season != nil && r.episode != nil) ? "\(r.imdb):\(r.season ?? 0):\(r.episode ?? 0)" : r.imdb
-        let groups = await AddonClient.shared.streams(for: sid, type: r.item.type, addons: store.addons)
+        let groups = await AddonClient.shared.streams(for: sid, type: r.item.type, addons: store.activeAddons)
         // Task-group results arrive in completion order; keep the user's add-on order.
         var ordered: [(Addon, [StreamItem])] = []
-        for a in store.addons {
+        for a in store.activeAddons {
             guard let g = groups.first(where: { $0.0.id == a.id }) else { continue }
             let playable = g.1.filter(\.isPlayable)
             if !playable.isEmpty { ordered.append((a, playable)) }

@@ -50,7 +50,7 @@ enum ThemeCatalog {
         await withTaskGroup(of: (Int, ThemeRow?).self) { group in
             for (i, t) in today(count: count, offset: offset).enumerated() {
                 group.addTask {
-                    let items = await TMDBClient.shared.themed(keywords: t.keywords, limit: limit)
+                    let items = await MetadataService.shared.themed(keywords: t.keywords, limit: limit)
                     return (i, items.count >= 3 ? ThemeRow(id: "theme-\(t.title)", title: t.title, items: items) : nil)
                 }
             }

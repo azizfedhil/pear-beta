@@ -44,6 +44,9 @@ struct DetailView: View {
     @State private var episodes: [EpisodeItem] = []
     @State private var loadingEpisodes = false
     @State private var seasonsExpanded = false
+    /// Season headers from the unified metadata layer (AIOMetadata season service when live, else
+    /// nil and `details?.seasons` is used). Only ever populated in AIOMetadata mode.
+    @State private var facadeSeasons: [TMDBClient.SeasonInfo]?
     @State private var trailers: [TMDBClient.Video] = []
     @State private var openTrailer: TMDBClient.Video?
 
@@ -75,14 +78,41 @@ struct DetailView: View {
     }
 
     private var seasonChips: [SeasonChip] {
-        if let s = details?.seasons, !s.isEmpty {
+        if let s = facadeSeasons ?? details?.seasons, !s.isEmpty {
             return s.filter { ($0.episodeCount ?? 1) > 0 }
                 .sorted { ($0.seasonNumber == 0 ? Int.max : $0.seasonNumber) < ($1.seasonNumber == 0 ? Int.max : $1.seasonNumber) }
-                .map { SeasonChip(id: $0.seasonNumber, title: $0.title, poster: $0.posterURL, count: $0.episodeCount) }
+                .map { SeasonChip(id: $0.seasonNumber, title: $0.name ?? "Season \($0.seasonNumber)", poster: seasonPoster($0), count: $0.episodeCount) }
         }
         return (1...max(details?.numberOfSeasons ?? 1, 1)).map {
             SeasonChip(id: $0, title: "Season \($0)", poster: nil, count: nil)
         }
+    }
+
+    /// TMDB's `SeasonInfo` carries only `posterPath`; the artwork URL is built here so the facade
+    /// season list and the merged-details list render identically.
+    private func seasonPoster(_ s: TMDBClient.SeasonInfo) -> URL? {
+        guard let p = s.posterPath else { return nil }
+        return URL(string: "https://image.tmdb.org/t/p/" + "w185" + p)
+    }
+
+    /// Season headers from the unified layer when AIOMetadata is live, else the (merged) TMDB ones.
+    private var seasonList: [TMDBClient.SeasonInfo]? { facadeSeasons ?? details?.seasons }
+
+    /// Episode count of a season, preferring the loaded episode list for the open season.
+    private func seasonTotal(_ s: Int, loaded: Int) -> Int? {
+        if s == season && loaded > 0 { return loaded }
+        return seasonList?.first(where: { $0.seasonNumber == s })?.episodeCount
+    }
+
+    // MARK: Reactive metadata-source key
+
+    /// Changes whenever the metadata mode or the AIOMetadata endpoint changes. Used as a `.task(id:)`
+    /// value so switching sources in Settings reloads details/seasons/episodes without pop-and-push.
+    /// Pure UserDefaults reads — no polling, no observers; re-evaluated only when the view's state
+    /// changes (e.g. right after the picker write) or the body otherwise re-renders.
+    private var metaKey: String {
+        let m = meta.mode == .aiometadata ? "aio" : "builtin"
+        return "\(m)|\(AIOMetadataClient.shared.baseURL)"
     }
 
     // MARK: Body
@@ -115,34 +145,50 @@ struct DetailView: View {
         .fullScreenCover(item: $playRequest) { r in
             PlayerScreen(request: r, provider: makeProvider(), onClose: { playRequest = nil })
         }
-        .task {
-            // Native metadata + suggestions (no-ops without a TMDB key).
-            async let d = try? TMDBClient.shared.details(for: item.id, type: item.type)
-            async let s = try? TMDBClient.shared.recommendations(for: item.id, type: item.type)
+        .task(id: metaKey) {
+            // Native metadata + suggestions (no-ops without a TMDB key), via the unified metadata
+            // layer. Keyed on the metadata mode/endpoint so switching sources in Settings reloads
+            // this view's data instead of keeping answers from the previous provider.
+            async let d = meta.details(for: item)
+            async let s = meta.recommendations(for: item)
             details = await d
-            similar = await s ?? []
+            similar = await s
         }
-        .task {
+        .task(id: metaKey) {
             guard MDBListClient.shared.hasKey, let imdb = await stremioID() else { return }
             imdbID = imdb
-            ratings = await MDBListClient.shared.ratings(imdb: imdb, type: item.type)
+            ratings = await meta.ratings(for: item, imdb: imdb)
         }
-        .task { logoURL = await LogoResolver.shared.logo(for: item) }
-        .task { trailers = await TMDBClient.shared.videos(for: item.id, type: item.type) }
+        .task(id: metaKey) { logoURL = await meta.logo(for: item) }
+        .task(id: metaKey) { trailers = await meta.trailerVideos(for: item) }
+        .task(id: "season|\(isSeries ? item.id : "")|\(metaKey)") {
+            // Season headers through the unified layer, but only when AIOMetadata can actually
+            // answer (mode selected + endpoint configured). In builtin mode `details?.seasons`
+            // already carries TMDB's list — fetching here would duplicate that request.
+            guard isSeries, meta.aioSeasonSourceAvailable else { return }
+            let imdb = item.id.hasPrefix("tt") ? item.id : await stremioID()
+            let s = await meta.seasons(for: item, imdb: imdb)
+            guard !Task.isCancelled else { return }
+            facadeSeasons = s
+        }
 
         .task { await configureFromHistory() }
-        .task(id: season) { await loadEpisodes() }
+        .task(id: "eps|\(season)|\(metaKey)") { await loadEpisodes() }
         .task(id: showSources) {
-            // Query stream add-ons only when the picker opens.
+            // Query stream add-ons only when the picker opens. Stream selection is deliberately
+            // independent of the metadata-source mode: it always uses the active addon list.
             guard showSources else { return }
             streams = []
             loadingStreams = true; defer { loadingStreams = false }
             guard let imdb = await stremioID() else { return }
             imdbID = imdb
             let sid = isSeries ? "\(imdb):\(season):\(episode)" : imdb
-            streams = await AddonClient.shared.streams(for: sid, type: item.type, addons: store.addons)
+            streams = await AddonClient.shared.streams(for: sid, type: item.type, addons: store.activeAddons)
         }
     }
+
+    /// Unified metadata facade (provider selection, fallbacks and merging live there).
+    private var meta: MetadataService { .shared }
 
     // MARK: Header
 
@@ -330,9 +376,7 @@ struct DetailView: View {
     /// The show's watched marker sits on its last-watched episode; a season counts when that episode is inside it.
     private func seasonProgress(_ s: Int) -> (watchedEpisodes: Int, total: Int)? {
         guard let en = history.entry(for: item.id), en.isFinished, let se = en.seasonEpisode else { return nil }
-        let total: Int?
-        if se.season == s { total = episodes.isEmpty ? details?.seasons?.first(where: { $0.seasonNumber == s })?.episodeCount : episodes.count }
-        else { total = details?.seasons?.first(where: { $0.seasonNumber == s })?.episodeCount }
+        let total = seasonTotal(s, loaded: episodes.count)
         guard let total, total > 0 else { return nil }
         if se.season < s { return (total, total) }
         guard se.season == s else { return nil }
@@ -347,14 +391,12 @@ struct DetailView: View {
     private func setSeasonWatched(_ s: Int, _ watched: Bool) {
         withAnimation {
             if watched {
-                let count = details?.seasons?.first(where: { $0.seasonNumber == s })?.episodeCount
-                    ?? (s == season && !episodes.isEmpty ? episodes.count : nil)
-                    ?? 10
+                let count = seasonTotal(s, loaded: episodes.count) ?? 10
                 TitleActions.markWatched(item, history: history, season: s, episode: count)
             } else if isSeasonWatched(s), let en = history.entry(for: item.id), let se = en.seasonEpisode {
                 // Pull the marker back to the last episode of the previous season.
                 let prevSeason = max(se.season - 1, 1)
-                let prevCount = details?.seasons?.first(where: { $0.seasonNumber == prevSeason })?.episodeCount ?? 10
+                let prevCount = seasonList?.first(where: { $0.seasonNumber == prevSeason })?.episodeCount ?? 10
                 history.markWatched(item, key: "\(prevSeason):\(prevCount)", season: prevSeason, episode: prevCount,
                                     duration: en.duration)
             } else {
@@ -461,7 +503,7 @@ struct DetailView: View {
     private func loadEpisodes() async {
         guard isSeries else { return }
         loadingEpisodes = true
-        let list = await EpisodeLoader.load(itemID: item.id, type: item.type, season: season) { await ensureIMDB() }
+        let list = await meta.episodes(for: item, season: season)
         guard !Task.isCancelled else { return }
         episodes = list
         loadingEpisodes = false
@@ -552,12 +594,8 @@ struct DetailView: View {
 
     // MARK: IDs
 
-    private func ensureIMDB() async -> String? {
-        if imdbID == nil { imdbID = await stremioID() }
-        return imdbID
-    }
-
-    private func stremioID() async -> String? { await SourceResolver.stremioID(for: item) }
+    /// Stremio/IMDb id for this title, through the unified layer (id resolution + caching live there).
+    private func stremioID() async -> String? { await meta.stremioID(for: item) }
 
     // MARK: Sources + pinning
 
@@ -593,14 +631,15 @@ struct DetailView: View {
     }
 
     /// Lets the player browse episodes and jump to another one using the same add-ons and pins.
+    /// Metadata (episode lists) goes through the unified layer; stream resolution stays addon-based.
     private func makeProvider() -> EpisodeProvider? {
         guard isSeries else { return nil }
-        let item = item, addons = store.addons, pins = pins
+        let item = item, addons = store.activeAddons, pins = pins
         let options = seasonChips.map { SeasonOption(id: $0.id, title: $0.title) }
         return EpisodeProvider(
             seasons: options,
             episodes: { s in
-                await EpisodeLoader.load(itemID: item.id, type: item.type, season: s) { await SourceResolver.stremioID(for: item) }
+                await MetadataService.shared.episodes(for: item, season: s)
             },
             resolve: { s, ep, current in
                 await SourceResolver.request(season: s, episode: ep, current: current, addons: addons, pins: pins)
