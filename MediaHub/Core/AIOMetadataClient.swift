@@ -41,7 +41,7 @@ actor AIOMetadataClient {
     private var seasonListCache: [String: [TMDBClient.SeasonInfo]?] = [:]  // imdb -> seasons (nil = asked, no answer)
     private var logoCache: [String: URL?] = [:]
     private var idCache: [String: String?] = [:]           // tmdb:… -> stremio/IMDb id
-    private var inflight: [String: Task<Any, Error>] = [:]   // type-erased; `coalesce` casts results back to T
+    private var inflight: [String: Task<Any, Error>] = [:]
 
     /// Safe default: nothing is configured until the user enters a URL, so `.aiometadata` mode
     /// behaves exactly like `.builtin` (zero extra requests) until then.
@@ -137,26 +137,25 @@ actor AIOMetadataClient {
         let description: String?
         let resources: [Resource]?
         let catalogs: [Catalog]?
-        /// Older manifests declare resources as plain strings ("stream"); accept both shapes.
-        init(from decoder: Decoder) throws {
-            let c = try decoder.container(keyedBy: K.self)
-            id = try c.decodeIfPresent(String.self, forKey: .id)
-            name = try c.decodeIfPresent(String.self, forKey: .name)
-            version = try c.decodeIfPresent(String.self, forKey: .version)
-            description = try c.decodeIfPresent(String.self, forKey: .description)
-            catalogs = try c.decodeIfPresent([Catalog].self, forKey: .catalogs)
-            var res: [Resource]?
-            if let objs = try? c.decode([Resource].self, forKey: .resources) { res = objs }
-            else if let strs = try? c.decode([String].self, forKey: .resources) {
-                res = strs.map { Resource(name: $0, types: nil, idPrefixes: nil, apiKeys: nil) }
-            }
-            resources = res
+
+        private enum CodingKeys: String, CodingKey {
+            case id, name, version, description, catalogs, resources
         }
-        private struct K: CodingKey {
-            var stringValue: String; var intValue: Int?
-            init(_ s: String) { stringValue = s; intValue = nil }
-            init?(stringValue: String) { self.stringValue = stringValue; intValue = nil }
-            init?(intValue: Int) { return nil }
+
+        init(from decoder: Decoder) throws {
+            let c = try decoder.container(keyedBy: CodingKeys.self)
+            self.id = try c.decodeIfPresent(String.self, forKey: .id)
+            self.name = try c.decodeIfPresent(String.self, forKey: .name)
+            self.version = try c.decodeIfPresent(String.self, forKey: .version)
+            self.description = try c.decodeIfPresent(String.self, forKey: .description)
+            self.catalogs = try c.decodeIfPresent([Catalog].self, forKey: .catalogs)
+            if let objs = try? c.decode([Resource].self, forKey: .resources) {
+                self.resources = objs
+            } else if let strs = try? c.decode([String].self, forKey: .resources) {
+                self.resources = strs.map { Resource(name: $0, types: nil, idPrefixes: nil) }
+            } else {
+                self.resources = nil
+            }
         }
     }
 
@@ -265,15 +264,16 @@ actor AIOMetadataClient {
     /// already hit, the network is skipped entirely. `inflight` is only mutated by actor-isolated
     /// code with no suspension between check-and-register, so there is no leader race, and because
     /// callers share one task there is no "leader finished but cache still empty" retry storm.
-    private func coalesce<T: Sendable>(_ key: String, _ work: @escaping () async -> T) async -> T {
+    private func coalesce<T: Sendable>(key: String, _ body: @Sendable @escaping () async throws -> T) async throws -> T {
         if let running = inflight[key] {
-            // Type guard: distinct lookup kinds must never share a key by accident.
-            if let result = await running.value as? T { return result }
+            return try await running.value as! T
         }
-        let t = Task { await work() }
-        inflight[key] = t
-        defer { inflight.removeValue(forKey: key) }
-        return await t.value as! T
+        let task = Task<Any, Error> {
+            try await body()
+        }
+        inflight[key] = task
+        defer { inflight[key] = nil }
+        return try await task.value as! T
     }
 
     private func encoded(_ s: String) -> String {
